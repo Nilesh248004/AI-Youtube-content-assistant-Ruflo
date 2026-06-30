@@ -1,6 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { generateContent } from "./api";
+import {
+  generateContent,
+  getServiceInfo,
+  regenerateContent,
+} from "./api";
+import {
+  copyToClipboard,
+  downloadJson,
+  downloadMarkdown,
+  packageToMarkdown,
+} from "./exportUtils";
 
 const INITIAL_FORM = {
   topic: "Docker vs Kubernetes",
@@ -94,7 +104,14 @@ function ValueView({ value, name = "" }) {
   return <p className="copy">{String(value)}</p>;
 }
 
-function ResultCard({ section, value }) {
+function ResultCard({
+  section,
+  value,
+  copied,
+  regenerating,
+  onCopy,
+  onRegenerate,
+}) {
   return (
     <article className={`result-card result-${section.key}`}>
       <header className="card-header">
@@ -107,10 +124,22 @@ function ResultCard({ section, value }) {
             <h2>{section.title}</h2>
           </div>
         </div>
-        <span className="complete-pill">
-          <span className="complete-dot" />
-          Complete
-        </span>
+        <div className="card-actions">
+          <span className="complete-pill">
+            <span className="complete-dot" />
+            Complete
+          </span>
+          <button type="button" onClick={() => onCopy(section.key, value)}>
+            {copied ? "Copied" : "Copy"}
+          </button>
+          <button
+            type="button"
+            disabled={regenerating}
+            onClick={() => onRegenerate(section.key)}
+          >
+            {regenerating ? "Working…" : "Regenerate"}
+          </button>
+        </div>
       </header>
       <ValueView value={value} name={section.key} />
     </article>
@@ -122,6 +151,44 @@ function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [provider, setProvider] = useState({
+    status: "checking",
+    name: "backend",
+  });
+  const [copiedSection, setCopiedSection] = useState("");
+  const [regeneratingSection, setRegeneratingSection] = useState("");
+
+  useEffect(() => {
+    let active = true;
+
+    getServiceInfo()
+      .then((info) => {
+        if (active) {
+          setProvider({ status: "online", name: info.provider });
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setProvider({ status: "offline", name: "backend" });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const providerLabels = {
+    checking: "Connecting to backend…",
+    offline: "Backend offline",
+    dummy: "Demo mode · Dummy provider",
+    openai: "OpenAI · API mode",
+    ollama: "Ollama · Local model",
+  };
+
+  const providerLabel =
+    providerLabels[provider.status === "online" ? provider.name : provider.status] ||
+    `${provider.name} provider`;
 
   function updateField(event) {
     const { name, value } = event.target;
@@ -149,6 +216,30 @@ function App() {
     }
   }
 
+  async function handleCopy(section, value) {
+    try {
+      await copyToClipboard(value);
+      setCopiedSection(section);
+      window.setTimeout(() => setCopiedSection(""), 1600);
+    } catch {
+      setError("Clipboard access was blocked by the browser.");
+    }
+  }
+
+  async function handleRegenerate(section) {
+    setError("");
+    setRegeneratingSection(section);
+
+    try {
+      const updatedPackage = await regenerateContent(section, result);
+      setResult(updatedPackage);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setRegeneratingSection("");
+    }
+  }
+
   return (
     <main className="app-shell">
       <section className="hero">
@@ -159,9 +250,9 @@ function App() {
             </span>
             <span className="brand-name">CreatorFlow <b>AI</b></span>
           </div>
-          <div className="topbar-status">
+          <div className={`topbar-status status-${provider.status}`}>
             <span className="live-dot" />
-            Demo mode · No API key
+            {providerLabel}
           </div>
         </nav>
 
@@ -387,10 +478,28 @@ function App() {
                   <h2>{result.request.topic}</h2>
                   <p>Your publish-ready content workspace</p>
                 </div>
-                <span className="workflow-badge">
-                  <i>✓</i>
-                  {result.workflow.agents_executed.length} agents complete
-                </span>
+                <div className="results-heading-actions">
+                  <span className="workflow-badge">
+                    <i>✓</i>
+                    {result.workflow.agents_executed.length} agents complete
+                  </span>
+                  <div className="export-actions">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopy("all", packageToMarkdown(result))
+                      }
+                    >
+                      {copiedSection === "all" ? "Copied all" : "Copy all"}
+                    </button>
+                    <button type="button" onClick={() => downloadJson(result)}>
+                      Export JSON
+                    </button>
+                    <button type="button" onClick={() => downloadMarkdown(result)}>
+                      Export Markdown
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {SECTIONS.map((section) => (
@@ -398,6 +507,10 @@ function App() {
                   key={section.key}
                   section={section}
                   value={result[section.key]}
+                  copied={copiedSection === section.key}
+                  regenerating={regeneratingSection === section.key}
+                  onCopy={handleCopy}
+                  onRegenerate={handleRegenerate}
                 />
               ))}
             </>

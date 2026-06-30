@@ -9,13 +9,19 @@ To switch provider, update backend/.env.
 """
 
 import json
+import logging
 import os
 import re
+import time
 from typing import Any, Dict, Tuple
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
+
+from schemas import agent_json_schema, validate_agent_response
 
 load_dotenv()
+logger = logging.getLogger("creatorflow.llm")
 
 
 def _slug_words(value: str) -> str:
@@ -26,6 +32,42 @@ def _slug_words(value: str) -> str:
 def _minutes(duration: str) -> int:
     match = re.search(r"\d+", duration)
     return int(match.group()) if match else 8
+
+
+def _timeout_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("LLM_TIMEOUT_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
+def _max_retries() -> int:
+    try:
+        return max(0, min(5, int(os.getenv("LLM_MAX_RETRIES", "2"))))
+    except ValueError:
+        return 2
+
+
+def _openai_compatible_schema(value: Any) -> Any:
+    """Keep strict shape keywords while leaving value constraints to Pydantic."""
+
+    unsupported = {
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+    }
+    if isinstance(value, dict):
+        return {
+            key: _openai_compatible_schema(nested)
+            for key, nested in value.items()
+            if key not in unsupported
+        }
+    if isinstance(value, list):
+        return [_openai_compatible_schema(item) for item in value]
+    return value
 
 
 # -------------------------
@@ -232,6 +274,7 @@ def _review_response(data: Dict[str, Any]) -> Dict[str, Any]:
         "improvements": [
             f"Add one topic-specific statistic or real example for {topic}.",
             "Improve pacing after reading the script aloud.",
+            "Add the creator's personal experience before publishing.",
         ],
         "final_recommendation": "Ready for demo. Add real examples before publishing.",
     }
@@ -253,58 +296,7 @@ _DUMMY_HANDLERS = {
 # -------------------------
 
 def _schema_for_agent(agent_name: str) -> Dict[str, Any]:
-    schemas = {
-        "topic": {
-            "summary": "string",
-            "recommended_angle": "string",
-            "audience_needs": ["string"],
-            "key_points": ["string"],
-        },
-        "title": {
-            "titles": ["string"]
-        },
-        "script": {
-            "estimated_duration": "string",
-            "target_word_count": "number",
-            "hook": "string",
-            "introduction": "string",
-            "main_explanation": [
-                {
-                    "heading": "string",
-                    "content": "string",
-                }
-            ],
-            "real_life_example": "string",
-            "summary": "string",
-            "call_to_action": "string",
-        },
-        "thumbnail": {
-            "thumbnail_texts": ["string"]
-        },
-        "seo": {
-            "description": "string",
-            "tags": ["string"],
-            "hashtags": ["string"],
-            "pinned_comment": "string",
-        },
-        "shorts": {
-            "thirty_second_script": "string",
-            "sixty_second_script": "string",
-            "instagram_reel_caption": "string",
-            "hashtags": ["string"],
-        },
-        "review": {
-            "quality_score": "number",
-            "strengths": ["string"],
-            "improvements": ["string"],
-            "final_recommendation": "string",
-        },
-    }
-
-    if agent_name not in schemas:
-        raise ValueError(f"Unknown agent name: {agent_name}")
-
-    return schemas[agent_name]
+    return agent_json_schema(agent_name)
 
 
 def _agent_rules(agent_name: str) -> str:
@@ -415,7 +407,11 @@ def _call_openai(prompt: str) -> str:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing in .env")
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(
+        api_key=api_key,
+        timeout=_timeout_seconds(),
+        max_retries=_max_retries(),
+    )
     system_prompt = _build_system_prompt(agent_name, payload)
 
     try:
@@ -432,7 +428,16 @@ def _call_openai(prompt: str) -> str:
                 },
             ],
             temperature=0.7,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"{agent_name}_output",
+                    "strict": True,
+                    "schema": _openai_compatible_schema(
+                        _schema_for_agent(agent_name)
+                    ),
+                },
+            },
         )
 
     except RateLimitError as exc:
@@ -458,7 +463,7 @@ def _call_openai(prompt: str) -> str:
     try:
         json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"OpenAI returned invalid JSON: {content}") from exc
+        raise ValueError("OpenAI returned invalid JSON.") from exc
 
     return content
 
@@ -480,27 +485,35 @@ def _call_ollama(prompt: str) -> str:
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
     host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-    client = ollama.Client(host=host)
+    client = ollama.Client(host=host, timeout=_timeout_seconds())
     system_prompt = _build_system_prompt(agent_name, payload)
 
-    try:
-        response = client.generate(
-            model=model,
-            system=system_prompt,
-            prompt="Generate the required JSON output for this agent.",
-            stream=False,
-            format="json",
-            options={
-                "temperature": 0.7,
-            },
-        )
+    response = None
+    for attempt in range(_max_retries() + 1):
+        try:
+            response = client.generate(
+                model=model,
+                system=system_prompt,
+                prompt="Generate the required JSON output for this agent.",
+                stream=False,
+                format="json",
+                options={
+                    "temperature": 0.7,
+                },
+            )
+            break
+        except Exception as exc:
+            if attempt >= _max_retries():
+                raise RuntimeError(
+                    "Ollama call failed. Make sure Ollama is running and the configured model is available."
+                ) from exc
+            logger.warning(
+                "Ollama request failed; retrying",
+                extra={"attempt": attempt + 1},
+            )
+            time.sleep(min(2**attempt, 4))
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"Ollama call failed. Make sure Ollama is running and model '{model}' is pulled."
-        ) from exc
-
-    content = response.get("response", "")
+    content = response.get("response", "") if response else ""
 
     if not content:
         raise ValueError("Ollama returned empty response.")
@@ -508,7 +521,7 @@ def _call_ollama(prompt: str) -> str:
     try:
         json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Ollama returned invalid JSON: {content}") from exc
+        raise ValueError("Ollama returned invalid JSON.") from exc
 
     return content
 
@@ -534,16 +547,22 @@ def _call_dummy(prompt: str) -> str:
 
 def call_llm(prompt: str) -> str:
     provider = os.getenv("LLM_PROVIDER", "dummy").lower()
+    agent_name, _ = _extract_envelope(prompt)
 
     if provider == "openai":
-        return _call_openai(prompt)
+        content = _call_openai(prompt)
+    elif provider == "ollama":
+        content = _call_ollama(prompt)
+    elif provider == "dummy":
+        content = _call_dummy(prompt)
+    else:
+        raise ValueError(
+            f"Unsupported LLM_PROVIDER='{provider}'. Use dummy, openai, or ollama."
+        )
 
-    if provider == "ollama":
-        return _call_ollama(prompt)
-
-    if provider == "dummy":
-        return _call_dummy(prompt)
-
-    raise ValueError(
-        f"Unsupported LLM_PROVIDER='{provider}'. Use dummy, openai, or ollama."
-    )
+    try:
+        return validate_agent_response(agent_name, content)
+    except (ValidationError, ValueError) as exc:
+        raise ValueError(
+            f"{agent_name} agent returned content that failed validation."
+        ) from exc

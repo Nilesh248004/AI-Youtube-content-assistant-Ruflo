@@ -19,5 +19,10 @@ class FinalResponseAgent:
             "workflow": {
                 "style": "Ruflo-inspired sequential multi-agent orchestration",
                 "agents_executed": state["execution_trace"] + [self.name],
+                "last_run_agents": state.get(
+                    "last_run_agents",
+                    state["execution_trace"],
+                )
+                + [self.name],
             },
         }

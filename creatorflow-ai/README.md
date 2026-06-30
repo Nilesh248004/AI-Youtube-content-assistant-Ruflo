@@ -5,9 +5,11 @@ into a complete content package. It uses a lightweight, Ruflo-inspired
 multi-agent workflow with specialist agents for strategy, titles, scripting,
 thumbnails, SEO, short-form content, review, and final response assembly.
 
-No database or API key is required. The included dummy LLM provider produces
-realistic, deterministic demo output and is isolated behind one replaceable
-function.
+![CreatorFlow AI interface preview](docs/ui-preview.svg)
+
+No database is required. Choose the deterministic dummy provider, OpenAI, or a
+local Ollama model through environment configuration without changing the
+agents or orchestration workflow.
 
 ## Why Ruflo is useful here
 
@@ -95,7 +97,12 @@ agent -> call_llm(prompt) -> structured JSON contribution
 - Quality score, strengths, improvement ideas, and recommendation
 - FastAPI validation, CORS, and basic error handling
 - Responsive React UI with loading and error states
-- Provider-ready LLM boundary with no API key needed for the demo
+- Dummy, OpenAI, and Ollama provider support
+- Strict Pydantic validation for every agent response
+- Configurable provider timeouts, retries, CORS origins, and structured logs
+- Copy, JSON export, Markdown export, and targeted section regeneration
+- React error boundary and backend request timeouts
+- Automated backend tests and GitHub Actions verification
 
 ## Folder structure
 
@@ -105,8 +112,16 @@ creatorflow-ai/
 │   ├── main.py
 │   ├── orchestrator.py
 │   ├── llm_client.py
+│   ├── schemas.py
+│   ├── logging_config.py
 │   ├── requirements.txt
+│   ├── requirements-dev.txt
+│   ├── .env.example
 │   ├── README_BACKEND.md
+│   ├── tests/
+│   │   ├── conftest.py
+│   │   ├── test_api.py
+│   │   └── test_contracts.py
 │   └── agents/
 │       ├── __init__.py
 │       ├── topic_agent.py
@@ -119,13 +134,19 @@ creatorflow-ai/
 │       └── final_response_agent.py
 ├── frontend/
 │   ├── package.json
+│   ├── package-lock.json
+│   ├── .env.example
 │   ├── index.html
 │   ├── vite.config.js
 │   └── src/
 │       ├── main.jsx
 │       ├── App.jsx
+│       ├── ErrorBoundary.jsx
 │       ├── api.js
+│       ├── exportUtils.js
 │       └── App.css
+├── docs/
+│   └── ui-preview.svg
 ├── .gitignore
 └── README.md
 ```
@@ -139,6 +160,7 @@ cd creatorflow-ai/backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 uvicorn main:app --reload --port 8000
 ```
 
@@ -158,7 +180,8 @@ npm run dev
 Open `http://localhost:5173`.
 
 The frontend calls `http://localhost:8000/generate` by default. To use another
-backend URL, start Vite with a `VITE_API_URL` environment variable.
+backend URL, copy `frontend/.env.example` to `frontend/.env` and update
+`VITE_API_URL`.
 
 ## API
 
@@ -203,6 +226,27 @@ Only `topic` is required. The server uses these defaults for omitted fields:
 ```
 
 An empty or whitespace-only topic returns HTTP `422`.
+
+### Regenerate one section
+
+```http
+POST /regenerate/{section}
+Content-Type: application/json
+```
+
+Supported sections are `topic_analysis`, `titles`, `script`,
+`thumbnail_texts`, `seo`, `shorts`, and `review`. Send the current package as:
+
+```json
+{
+  "current_package": {
+    "...": "the complete response from POST /generate"
+  }
+}
+```
+
+The selected agent and all downstream agents run again. Upstream content stays
+unchanged, which preserves the workflow's dependency order.
 
 ## Sample response format
 
@@ -259,36 +303,67 @@ An empty or whitespace-only topic returns HTTP `422`.
   },
   "workflow": {
     "style": "Ruflo-inspired sequential multi-agent orchestration",
-    "agents_executed": ["topic_agent", "...", "final_response_agent"]
+    "agents_executed": ["topic_agent", "...", "final_response_agent"],
+    "last_run_agents": ["topic_agent", "...", "final_response_agent"]
   }
 }
 ```
 
-## Connecting a real LLM
+## LLM provider configuration
 
-Every specialist sends a JSON prompt envelope to:
+Copy the environment template:
 
-```python
-def call_llm(prompt: str) -> str:
-    ...
+```bash
+cd backend
+cp .env.example .env
 ```
 
-Replace the body of `backend/llm_client.py::call_llm` with an OpenAI, Gemini,
-Groq, or local Ollama request. Keep the function signature and return a valid
-JSON string matching the specialist's current contract. This central boundary
-keeps provider credentials and SDK details out of the agents and orchestrator.
+Use one of these provider values:
+
+```dotenv
+# Deterministic local demo; no API key or model download
+LLM_PROVIDER=dummy
+
+# OpenAI structured outputs
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your-key
+OPENAI_MODEL=gpt-4.1-mini
+
+# Local Ollama
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=llama3.2
+OLLAMA_HOST=http://localhost:11434
+```
+
+Provider calls use `LLM_TIMEOUT_SECONDS` and `LLM_MAX_RETRIES`. Every response
+is validated against the Pydantic contract in `backend/schemas.py` before an
+agent can contribute it to shared workflow state.
+
+## Testing
+
+```bash
+cd creatorflow-ai
+backend/venv/bin/pip install -r backend/requirements-dev.txt
+LLM_PROVIDER=dummy backend/venv/bin/python -m pytest backend/tests -q
+npm run build --prefix frontend
+```
+
+GitHub Actions runs the same backend test and frontend build checks for changes
+under `creatorflow-ai/`.
 
 ## Future improvements
 
-- Add selectable OpenAI, Gemini, Groq, and Ollama providers
-- Validate each LLM result with dedicated Pydantic response models
 - Run independent agents in parallel when their dependencies allow it
-- Add retries, timeouts, tracing, and token/cost reporting
+- Add distributed tracing and token/cost reporting
 - Add Ruflo MCP integration for external swarm coordination
 - Add persistent Ruflo/AgentDB-style memory for creator preferences
 - Ground research-heavy topics in cited sources
-- Export the package to Markdown, JSON, or a production calendar
-- Add script editing, regeneration, and per-section approval
+- Add a visual production calendar export
+- Add collaborative editing and per-section approval
+
+## License
+
+This project is available under the [MIT License](../LICENSE).
 
 ## Interview explanation
 
